@@ -41,8 +41,11 @@ in
 
     # The openvpn binaries have relative interpreter "ld-musl-x86_64.so.1".
     # The kernel resolves this as /ld-musl-x86_64.so.1, so we create a symlink.
+    # Also pre-create the ConnectionInfoFiles directory so bwrap has a mount
+    # point for the tmpfs below (the .deb doesn't ship this dir).
     extraBuildCommands = ''
       ln -s ${shared.exePrefix}/Service/Resources/openvpn/ld-musl-x86_64.so.1 $out/ld-musl-x86_64.so.1
+      mkdir -p $out/opt/awsvpnclient/ConnectionInfoFiles
     '';
 
     # .NET runtime requirements
@@ -74,6 +77,11 @@ in
       # Service writes temporary config files to /opt/awsvpnclient/Resources
       "--tmpfs"
       "/opt/awsvpnclient/Resources"
+      # Service writes per-connection info files here (keyed by openvpn PID).
+      # If this is read-only, the disconnect path hangs in the GUI's
+      # "Sending SIGTERM to OpenVPN" DBus call to ACVC.GTK.Service.
+      "--tmpfs"
+      "/opt/awsvpnclient/ConnectionInfoFiles"
     ];
 
     # Set .NET environment variables and ensure openvpn can find its interpreter.
