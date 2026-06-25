@@ -46,6 +46,13 @@
         "/var/run/dbus"
       ];
 
+      # .NET runtime: run in invariant-globalization mode (replaces the former
+      # runtimeconfig.json patch; the service sets the same vars in its profile).
+      profile = ''
+        export DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
+        export DOTNET_CLI_TELEMETRY_OPTOUT=1
+      '';
+
       extraInstallCommands = ''
         mkdir -p "$out/share/applications"
         cp "${desktopItem}/share/applications/AWS VPN Client.desktop" "$out/share/applications/AWS VPN Client.desktop"

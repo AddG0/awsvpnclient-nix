@@ -1,7 +1,10 @@
 # AWS VPN Client for NixOS - Service
 #
 # This package provides the AWS VPN Client background service in an FHS environment.
-# Using buildFHSEnv avoids LD_PRELOAD which breaks musl-based openvpn binaries.
+# buildFHSEnv provides libraries at standard paths without autoPatchelf, which would
+# rewrite the musl-based openvpn binaries. (A narrowly-scoped LD_PRELOAD shim is used
+# for the 5.4.0 D-Bus/caller-path workarounds - see acvc-hook.c - which the openvpn
+# binaries tolerate without modification.)
 # Run with: sudo nix run .#awsvpnclient-service
 {
   pkgs,
@@ -20,6 +23,25 @@
     fi
     exec ${pkgs.coreutils}/bin/env "$@"
   '';
+
+  # Compiled shim that works around two 5.4.0 behaviours (D-Bus boolean reply
+  # + ValidatePidBinaryPath caller check). See acvc-hook.c for the full rationale.
+  # It is LD_PRELOADed into the service via the profile below; the dbus-daemon and
+  # the musl openvpn/openssl children inherit it and must be able to load it too.
+  #
+  # FORTIFY_SOURCE MUST be disabled: it rewrites fprintf/memcpy into glibc's
+  # __*_chk variants, which musl does not provide. With fortify on, every musl
+  # child (openssl, acvc-openvpn) dies at load with "Error relocating ...
+  # __fprintf_chk: symbol not found", which surfaces as UnableToEnforceFipsException.
+  # Plain libc symbols resolve fine under both glibc and musl, so the hook becomes
+  # a harmless no-op in the musl processes.
+  acvcHook = pkgs.runCommandCC "awsvpnclient-acvc-hook" {
+    hardeningDisable = ["fortify" "fortify3"];
+  } ''
+    mkdir -p $out/lib
+    $CC -shared -fPIC -O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
+      -o $out/lib/acvc-hook.so ${./acvc-hook.c} -ldl
+  '';
 in
   buildFHSEnv {
     name = "${shared.pname}-service";
@@ -37,6 +59,7 @@ in
         lsof # /usr/bin/lsof
         procps # /sbin/sysctl
         iproute2 # /sbin/ip for routing
+        dbus # /usr/bin/dbus-daemon - service spawns its own private bus (5.4.0+)
       ];
 
     # The openvpn binaries have relative interpreter "ld-musl-x86_64.so.1".
@@ -90,6 +113,9 @@ in
     profile = ''
       export DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
       export DOTNET_CLI_TELEMETRY_OPTOUT=1
+      # Preload the 5.4.0 D-Bus / caller-path workaround shim (see acvc-hook.c).
+      # Inherited by the private dbus-daemon and openvpn children.
+      export LD_PRELOAD="${acvcHook}/lib/acvc-hook.so''${LD_PRELOAD:+:$LD_PRELOAD}"
       cd /
     '';
   }

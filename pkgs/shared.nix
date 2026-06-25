@@ -1,14 +1,14 @@
 # AWS VPN Client for NixOS - Shared Components
 #
 pkgs: let
-  inherit (pkgs) lib stdenv fetchurl;
+  inherit (pkgs) stdenv fetchurl;
 
   pname = "awsvpnclient";
 
   # Version information
   versionInfo = {
-    version = "5.3.1";
-    sha256 = "4a426cc226382748d683a4946340447dab87ec42583977d9488ee45d11cdcec0";
+    version = "5.4.0";
+    sha256 = "7dd9e28962bf64bf94ef41b8e1f68de5e0d0393d71300767698fb336c69276cc";
   };
 
   srcUrl = versionInfo: "https://d20adtppz83p9s.cloudfront.net/GTK/${versionInfo.version}/awsvpnclient_amd64.deb";
@@ -18,28 +18,37 @@ pkgs: let
   guiExe = "${exePrefix}/awsvpnclient";
   serviceExe = "${exePrefix}/Service/ACVC.GTK.Service";
 
-  # https://github.com/BOPOHA/aws-rpm-packages/tree/51c6a0569dab2761b4a83361c0f5173ed00ef8ee
-  patchPrefix = "https://raw.githubusercontent.com/BOPOHA/aws-rpm-packages/51c6a0569dab2761b4a83361c0f5173ed00ef8ee/awsvpnclient";
-  patchInfos = [
-    {
-      url = "${patchPrefix}/acvc.gtk..deps.patch";
-      sha256 = "sha256-TB3KavtX+lNdCx3IhQYsAJTBmpIVhDYqHrwYM2Te3HM=";
-    }
-    {
-      url = "${patchPrefix}/awsvpnclient.deps.patch";
-      sha256 = "sha256-Eehpbz7S62PfXtdURVX3FrLTITYtEFVrP8sxPRJMadQ=";
-    }
-    {
-      url = "${patchPrefix}/awsvpnclient.runtimeconfig.patch";
-      sha256 = "sha256-+EZlLWSprpYkECjd0RyK1NmlJOoylS1A/+ry+AoUAcE=";
-    }
-  ];
-
-  fetchedPatches = map (patch:
-    fetchurl {
-      inherit (patch) url sha256;
-    })
-  patchInfos;
+  # Modeled on https://github.com/BOPOHA/aws-rpm-packages (awsvpnclient/remove-sqlite-from-deps.sh).
+  #
+  # Previously this used static .patch files pinned to a BOPOHA commit, but those break on every
+  # AWS release because the .deps.json line numbers shift. Instead we apply the same transforms
+  # programmatically with jq, so a version bump only needs `version` + `sha256` above.
+  #
+  # Strip the bundled SQLite assemblies/native libs (Microsoft.Data.Sqlite, SQLitePCLRaw,
+  # libe_sqlite3.so) and the .NET diagnostics-only native libs (createdump, libmscordaccore.so,
+  # libmscordbi.so, libcoreclrtraceptprovider.so) from the .deps.json files.
+  #
+  # SQLite MUST be stripped: the bundled libe_sqlite3.so segfaults the process when the metrics
+  # DB is opened (a hard native crash with no managed exception). With the assembly removed from
+  # the manifest, the optional metrics code instead throws a caught "Could not load file or
+  # assembly" exception and the app continues normally (metrics are non-essential telemetry).
+  stripDepsJq = pkgs.writeText "strip-sqlite-and-debug.jq" ''
+    walk(
+      if type == "object" then
+        with_entries(
+          (.key | ascii_downcase) as $lk
+          | select(
+              ($lk | contains("sqlite"))
+              or (.key == "createdump")
+              or (.key == "libcoreclrtraceptprovider.so")
+              or (.key == "libmscordaccore.so")
+              or (.key == "libmscordbi.so")
+              | not
+            )
+        )
+      else . end
+    )
+  '';
 
   mkDeb = versionInfo:
     stdenv.mkDerivation {
@@ -65,15 +74,14 @@ pkgs: let
       '';
 
       buildPhase = ''
-        # Apply source patches
+        # Strip SQLite + diagnostics natives from the .NET manifests (see stripDepsJq).
+        # Invariant globalization is handled via DOTNET_SYSTEM_GLOBALIZATION_INVARIANT
+        # in the GUI/service profiles, so no runtimeconfig.json edit is needed here.
         cd opt/awsvpnclient
-        ${lib.concatStringsSep "\n" (map (patch: ''
-            cp ${patch} tmp.patch
-            sed -i -E 's|([+-]{3}) (\")?/opt/awsvpnclient/|\1 \2./|g' tmp.patch
-            patch -p1 < tmp.patch
-            rm tmp.patch
-          '')
-          fetchedPatches)}
+        for deps in "AWS VPN Client.deps.json" "Service/ACVC.GTK.Service.deps.json"; do
+          ${pkgs.jq}/bin/jq -f ${stripDepsJq} "$deps" > "$deps.tmp"
+          mv "$deps.tmp" "$deps"
+        done
         cd ../..
 
         # Rename to something more "linux-y"
