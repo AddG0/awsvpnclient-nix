@@ -5,192 +5,259 @@ This document captures the debugging process and key learnings for packaging the
 ## Architecture Overview
 
 The package is split into:
-- `shared.nix` - Core deb extraction and patching (used by both GUI and service)
-- `application.nix` - GUI application wrapped in buildFHSEnv
-- `service.nix` - Background service wrapped in buildFHSEnv
-- `acvc-hook.c` - small LD_PRELOAD shim the service needs for the 5.4.0 D-Bus
-  and caller-path checks (see "Version 5.4.0 workarounds" below)
+- `pkgs/shared.nix` - deb extraction (used by both GUI and daemon)
+- `pkgs/application.nix` - Electron GUI wrapped in buildFHSEnv
+- `pkgs/service.nix` - privileged daemon wrapped in buildFHSEnv
+- `pkgs/caller-path-hook.c` - small LD_PRELOAD shim so the daemon's caller check
+  accepts the sandboxed GUI/CLI (see "Caller path validation" below)
+- `module.nix` - NixOS module (systemd unit + state/runtime directories)
+
+## What 6.0.0 changed
+
+6.0.0 ("Zentry") is a ground-up rewrite and invalidates almost everything the 5.x
+packaging had to work around:
+
+| 5.x | 6.x |
+|-----|-----|
+| .NET/GTK GUI (`ACVC.GTK`) | Electron 40 GUI |
+| .NET service (`ACVC.GTK.Service`) | single Rust binary `aws-client-vpn-daemon` |
+| D-Bus IPC (private `dbus-daemon`) | gRPC over a Unix socket |
+| bundled musl `acvc-openvpn` + `openssl` subprocesses | OpenVPN 3 and aws-lc linked in-process |
+| SHA256 checksum validation of openvpn resources | none |
+| FIPS provider had to be activated via `fipsinstall` | no activation step; `UnableToEnforceFipsException` is gone |
+| SQLite native lib segfaulted, stripped from `.deps.json` | SQLite works; no manifest edits |
+| no CLI | `aws-vpn-client` CLI, exposed as `.#awsvpnclient-cli` |
+| GTK front-end followed the system theme | Electron paints its own light-only palette |
+
+So the musl/LD_PRELOAD hazards, the `.deps.json` `jq` rewrite, the `fipsmodule.cnf`
+generation, the `env` PATH wrapper, and the D-Bus boolean shim are all gone. What
+remains is the caller-path hook, the two dropdown-popup patches, and - only if you
+want the GUI themed - the palette rewrite described below.
+
+Runtime layout:
+- IPC socket: `/run/awsvpnclient/com.aws.vpn-client.daemon.sock` (mode 0666, so the
+  unprivileged GUI can connect)
+- state: `/var/lib/awsvpnclient` (**must be 0700**)
+- logs: `/var/log/awsvpnclient/aws_vpn_client_{daemon,cli,gui}_<date>.log`
+
+On first run the daemon migrates 5.x profiles and preferences into its own store.
 
 ## Updating the version
 
-For a routine bump, edit `versionInfo` in `shared.nix` (`version` + `sha256`) with
-the values from the [AWS Linux release notes](https://docs.aws.amazon.com/vpn/latest/clientvpn-user/client-vpn-connect-linux-release-notes.html),
-then `nix build .#awsvpnclient-service .#default`. The `.deps.json` edits, FIPS
-config, and the D-Bus/caller-path workarounds are all version-independent, so a bump
-should not need anything else - but AWS does add new runtime checks between releases
-(5.4.0 added three; see below), so test an actual connection after upgrading.
+For a routine bump, edit `versionInfo` in `pkgs/shared.nix` (`version` + `sha256`)
+with the values from the [AWS Linux release notes](https://docs.aws.amazon.com/vpn/latest/clientvpn-user/client-vpn-connect-linux-release-notes.html),
+then `nix build .#awsvpnclient-service .#default`. Test an actual connection
+afterwards - AWS adds new runtime checks between releases.
+
+Get the hash with:
+
+```bash
+nix store prefetch-file --hash-type sha256 --json \
+  "https://d20adtppz83p9s.cloudfront.net/GTK/<version>/awsvpnclient_amd64.deb"
+nix hash convert --hash-algo sha256 --to base16 "sha256-..."
+```
 
 ## Key Challenges & Solutions
 
-### 1. Musl-based OpenVPN Binaries
+### 1. Why buildFHSEnv for the GUI and daemon
 
-**Problem**: The AWS VPN Client ships with custom openvpn binaries (`acvc-openvpn`) compiled against musl libc, not glibc. Nix's `autoPatchelfHook` incorrectly patches these to use glibc, breaking them.
+Both resolve paths under a hardcoded `/opt/awsvpnclient` prefix - the daemon reads
+`app_version` and runs `dns/configure-dns`; `configure-dns` in turn calls
+`/usr/bin/{mkdir,rm,date,resolvectl}` by absolute path. The daemon's RPATH also starts
+with `$ORIGIN`, which is how it finds the aws-lc `libssl.so`/`libcrypto.so` it ships
+beside itself, and `patchelf --shrink-rpath` would drop that entry. So `mkDeb` sets
+`dontPatchELF`/`dontStrip`/`dontPatchShebangs`, and those two run under `buildFHSEnv`,
+which supplies libraries at standard paths without touching the binaries.
 
-**Solution**: Use `buildFHSEnv` instead of `autoPatchelfHook`. The FHS environment provides libraries at standard paths without LD_PRELOAD, which would break musl binaries.
+The CLI is the exception: it resolves nothing under the prefix and links only
+libc/libm/libgcc_s, so it uses `autoPatchelfHook` and skips the sandbox entirely.
 
-```nix
-# In shared.nix - disable all ELF modifications
-dontPatchELF = true;
-dontStrip = true;
-dontPatchShebangs = true;
-nativeBuildInputs = [];
-buildInputs = [];
+### 2. Only `opt/` may be installed from the .deb
+
+A top-level directory present in the FHS rootfs is `--ro-bind`ed over the host's and
+excluded from bubblewrap's automatic host bind-mounts. The .deb ships an empty
+`var/lib/awsvpnclient`, so installing `var/` would leave the daemon with an empty,
+unwritable `/var/lib` and `/var/log` inside the sandbox. (`/etc` is the exception -
+buildFHSEnv binds its children individually and always exposes the host's as
+`/.host-etc` - but the .deb's `etc/systemd` and `usr/` are unused anyway: the unit
+comes from `module.nix` and the desktop entry from `application.nix`.)
+`installPhase` copies `opt/` only.
+
+### 3. Three trees, one download
+
+`mkDeb` extracts the .deb and nothing else; the daemon and CLI use it as-is.
+`mkGuiFiles` builds the GUI's tree on top: it symlinks 26 of the 27 entries straight
+back to `mkDeb`'s output and materialises only `resources/`, with `app.asar` rebuilt.
+
+The one entry it cannot symlink is the Electron executable. `/proc/self/exe` resolves
+symlinks, and Electron looks for `resources/` next to the *resolved* path - so a
+symlinked binary silently loads the original, unpatched asar. That 205 MB copy is the
+price of patching anything in the asar at all.
+
+### 4. Executable bits
+
+The .deb ships `aws-client-vpn-daemon`, `aws-vpn-client` and `dns/configure-dns`
+non-executable and relies on its `postinst` to `chmod` them. `shared.nix` does that
+at build time.
+
+### 5. Caller path validation
+
+Every IPC request is guarded by the daemon's process validator: it `readlink()`s
+`/proc/<caller>/exe` and rejects the call unless the executable sits directly in
+`/opt/awsvpnclient`. Because the GUI runs in its own bubblewrap sandbox where
+`/opt/awsvpnclient` is a bind mount of a Nix store path, the daemon (in a different
+mount namespace) sees:
+
+```
+Binary path of caller PID: 418916 is
+/nix/store/...-awsvpnclient-deb-6.0.1/opt/awsvpnclient/AWS VPN Client, not allowed
 ```
 
-### 2. Checksum Validation
+`caller-path-hook.c` is LD_PRELOADed into the daemon and rewrites a `/proc/<pid>/exe`
+target ending in `/opt/awsvpnclient/AWS VPN Client` or `/opt/awsvpnclient/aws-vpn-client`
+back to that bare path. Everything else is returned untouched.
 
-**Problem**: The .NET service validates SHA256 checksums of files in `/opt/awsvpnclient/Service/Resources/openvpn/`. Any modification causes:
+The validator only accepts those two names, so **neither binary may be renamed**
+(5.x packaging renamed `AWS VPN Client` to `awsvpnclient`; doing that now breaks IPC).
+
+FORTIFY_SOURCE is disabled when building the hook because it defines libc symbols
+that glibc's fortified headers redirect to `__*_chk` variants.
+
+### 6. State directory permissions
+
+The daemon validates `/var/lib/awsvpnclient` and refuses it unless the mode is
+exactly 0700:
+
 ```
-ACVC.Core.OpenVpn.OvpnResourcesChecksumValidationFailedException
-```
-
-**Solution**: Never modify files in the openvpn resources directory. This includes:
-- `acvc-openvpn`
-- `openssl`
-- `openssl.cnf` (added to the checksum list in 5.4.0)
-- `configure-dns`
-- `ld-musl-x86_64.so.1`
-- `fips.so`
-- `libc.so`
-
-`fipsmodule.cnf` is *generated* at build time (`openssl fipsinstall`) and is not in
-the checksum list, so generating it is safe. See "FIPS enforcement" below.
-
-### 3. Relative Interpreter Path
-
-**Problem**: The musl openvpn binary has interpreter `ld-musl-x86_64.so.1` (relative, not absolute). The kernel resolves this from the current working directory:
-- cwd=`/` → looks for `/ld-musl-x86_64.so.1`
-- cwd=`/tmp` → looks for `/tmp/ld-musl-x86_64.so.1` (fails)
-
-**Solution**:
-1. Create symlink at `/ld-musl-x86_64.so.1` pointing to the real musl loader
-2. Set `cd /` in the FHS profile so the service runs from root
-
-```nix
-extraBuildCommands = ''
-  ln -s ${shared.exePrefix}/Service/Resources/openvpn/ld-musl-x86_64.so.1 $out/ld-musl-x86_64.so.1
-'';
-
-profile = ''
-  cd /
-'';
+Existing directory has insecure permissions path=/var/lib/awsvpnclient
+  error=Directory has insecure permissions: 755, expected 700
+Metrics initialization failed, continuing without metrics
 ```
 
-### 4. Read-Only Resources Directory
+This is non-fatal (only metrics are lost), but the module sets
+`StateDirectory=awsvpnclient` with `StateDirectoryMode=0700`. A 5.x install leaves a
+0755 directory behind, which is where this bites on upgrade.
 
-**Problem**: The service writes temporary config files to `/opt/awsvpnclient/Resources/`, but buildFHSEnv mounts the Nix store as read-only:
-```
-System.IO.IOException: Read-only file system : '/opt/awsvpnclient/Resources/...'
-```
+### 7. Theming the GUI
 
-**Solution**: Mount a tmpfs on the Resources directory:
-```nix
-extraBwrapArgs = [
-  "--tmpfs" "/opt/awsvpnclient/Resources"
-];
-```
+Upstream's UI is light-only and has no theme support whatsoever: no
+`prefers-color-scheme`, no `nativeTheme`, no theme preference, and a 549-byte
+stylesheet. Electron 40 is also built without Blink's auto-dark feature - the binary
+has no `WebContentsForceDark` string - so `--force-dark-mode` only flips
+`nativeTheme`, which `main.js` never reads. Stylix cannot reach any of it, because
+the app paints its own colours rather than using a toolkit.
 
-### 5. Broken PATH for #!/usr/bin/env bash Scripts
+What it does have is a contiguous block of hex design tokens in the minified
+renderer bundle:
 
-**Problem**: When openvpn runs scripts via `#!/usr/bin/env bash`, the PATH becomes `/no-such-path`, causing all commands to fail:
-```
-mkdir: command not found
-date: command not found
+```js
+We="#FCFCFD",cu="#EBEBF0",qe="#FFFFFF",...,Ee="#FF9900",ha="#F0F0F0",_u="#DEDEE3"
 ```
 
-Scripts using `#!/bin/bash` work correctly (PATH is preserved).
+`designTokens` in `shared.nix` maps each to a base16 slot, and `mkGuiFiles` rewrites
+them when a palette is supplied. `programs.awsvpnclient.palette` defaults to
+`config.lib.stylix.colors`; `null` leaves the colours alone.
 
-**Root Cause**: Unknown interaction between musl openvpn, the kernel's shebang handling, and NixOS's coreutils env binary.
+Three things the token rewrite cannot express, all handled alongside it:
 
-**Solution**: Create a custom env wrapper that fixes PATH before calling the real env:
-```nix
-envWrapper = pkgs.writeShellScriptBin "env" ''
-  if [ -z "$PATH" ] || [ "$PATH" = "/no-such-path" ]; then
-    export PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:/run/current-system/sw/bin"
-  fi
-  exec ${pkgs.coreutils}/bin/env "$@"
-'';
+1. **On-accent text.** Upstream writes every primary button as
+   `background: Ee, color: F`, so `#0F141A` is *both* body text and the text drawn on
+   the accent - 9 of its 38 uses are on-accent. Both want dark in the stock light
+   theme; in a dark scheme body text must go light while on-accent text must stay
+   dark, and one literal cannot become two colours. The accent buttons are caught by
+   an attribute selector on their serialised inline background, appended to the
+   bundle's stylesheet (`style-src 'self'` permits a same-origin sheet; an inline
+   `<style>` would be blocked).
+2. **UA surfaces.** Chromium paints form-control popups, scrollbars and similar from
+   `color-scheme`, which the page never declares - hence a light dropdown over a dark
+   UI. The same appended stylesheet sets `:root{color-scheme:dark}`.
+3. **The native menubar.** Electron's default application menu is a GTK widget, so no
+   page CSS reaches it, and the host's GTK settings and theme packages are not on
+   `XDG_DATA_DIRS` inside the FHS env. `application.nix` derives polarity from
+   base00's perceived luminance and exports `GTK_THEME=Adwaita:dark` for dark
+   palettes. This is Adwaita, not the base16 palette; theming it properly would mean
+   getting a real GTK theme package and the user's `settings.ini` into the sandbox.
 
-targetPkgs = _: with pkgs; [
-  envWrapper  # Must be included to override default env
-  # ...
-];
+`app.asar` records a SHA256 per file in its header, so it is extracted and repacked
+rather than byte-patched (a length-preserving patch would leave the hashes stale -
+unenforced on Linux today, since Electron's ASAR integrity fuse is macOS/Windows
+only, but not worth relying on). `asar pack --unpack '*.node'` keeps
+`daemon-client.node` outside the archive where Electron can `dlopen` it; the build
+asserts it survives.
+
+**The package argument is `base16Palette`, not `palette`**: nixpkgs has a package
+called `palette`, so `callPackage` would inject it and shadow the `null` default,
+failing with `attribute 'base0D' missing`.
+
+Every mapped literal is asserted present before rewriting, so a release that
+reshuffles the palette fails the build instead of theming the app halfway.
+
+### 8. Dropdown popup patches
+
+Two upstream bugs in the Electron dropdown popup, both patched in `mkGuiFiles`
+whether or not a palette is set. Both use `substituteInPlace --replace-fail`, which
+doubles as the assertion.
+
+**Oversized window.** The popup is sized by formula, not content:
+
+```js
+const o = Math.min(e.length * 36 + 20, 204),   // height
+      c = t === ae ? n.width + 4 : 300;         // width - hardcoded for the actions menu
+g = new I({ width:c, height:o, frame:!1, transparent:!0, ... });
 ```
 
-### 6. .deps.json manifest edits (SQLite must be removed)
+Items render 32px tall, not 36, and the actions menu ignores its content width, so a
+4-item menu is a 300x164 window around 141x134 of painted content. Because the window
+is `transparent: true` the app never notices, but the compositor borders, rounds and
+hit-tests the full rect - and with no `color-scheme` declared, Chromium used to paint
+that dead area white, which is the light box that appeared around the menu. The patch
+measures `#root`'s first child after `ready-to-show` and `setBounds` to it. Width is
+only fitted for the actions menu; the profile dropdown's width deliberately tracks its
+select box, so that one keeps upstream's value (verified: select 299 wide -> popup 303,
+height 92 -> 68).
 
-**Problem**: The bundled `libe_sqlite3.so` **segfaults** the process the moment the
-metrics DB is opened - a hard native crash with no managed exception, so the GUI just
-disappears. (Earlier this was done with pinned BOPOHA `.patch` files, but those break
-on every release because `.deps.json` line numbers shift - that is what broke the
-5.3.1 -> 5.4.0 bump.)
+**Popup never closes.** The only automatic close path is `g.on("blur")`, and the main
+window has no handler that dismisses it. These transparent frameless XWayland windows
+do not reliably take focus under wlroots compositors, so blur never fires, the popup
+lingers, and `alwaysOnTop` is not honoured either - it ends up behind the main window.
+The patch adds `w.focus()` after `w.show()` so blur can fire at all, plus an
+`i.on("focus")` on the main window that closes the popup the same way blur does. The
+second path does not depend on the popup ever having been focused.
 
-**Solution**: `shared.nix` rewrites both `.deps.json` files with `jq` (version-independent),
-removing the SQLite assemblies/natives and the .NET diagnostics-only natives. With
-`Microsoft.Data.Sqlite` gone from the manifest, the optional metrics code throws a
-*caught* "Could not load file or assembly" exception and the app continues. Do NOT
-"fix" that log error by restoring SQLite - that reintroduces the segfault. Invariant
-globalization is set via `DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1` in both profiles
-(no `runtimeconfig.json` edit needed).
+**Both patches are textual, so the build runs `node --check` on the result.** An
+injection that produces invalid JS fails the build; without it a bad edit packs
+cleanly and the app simply refuses to start.
 
-### 7. FIPS enforcement
+### 9. DNS
 
-**Problem**: On connect the service runs the bundled `openssl list -providers` and
-requires the FIPS provider to be `active`, otherwise:
-```
-ACVC.Core.OpenVpn.UnableToEnforceFipsException: Unable to enforce openvpn in fips mode.
-```
+`dns/configure-dns` calls `/usr/bin/{mkdir,rm,date}` and `/usr/bin/resolvectl` by
+absolute path, so `coreutils` and `systemd` are in the daemon's `targetPkgs`;
+`resolvectl` reaches the host's `systemd-resolved` over the system bus under the
+bound-in `/run`. The module enables `services.resolved`.
 
-**Solution**: `shared.nix` generates `fipsmodule.cnf` at build time via
-`./openssl fipsinstall -out fipsmodule.cnf -module ./fips.so`. The shipped
-`openssl.cnf` `.include`s it by absolute path (`/opt/awsvpnclient/...`), which resolves
-correctly inside the FHS. `fipsmodule.cnf` holds only MACs (no paths), so it is
-location-independent. If FIPS "is not active", first check the openssl binary actually
-runs - see the LD_PRELOAD/musl note below.
-
-## Version 5.4.0 workarounds (D-Bus + caller path)
-
-5.4.0 re-architected the GUI<->service IPC and added two checks that the sandbox trips.
-Both are handled by a single LD_PRELOAD shim, `acvc-hook.c`, compiled in `service.nix`
-and preloaded onto the service via its profile. The private `dbus-daemon` and the musl
-`openssl`/`openvpn` children all inherit it.
-
-1. **Private D-Bus daemon.** The service now spawns its own `dbus-daemon`
-   (`unix:abstract=awsvpnclient`) instead of using the system bus, so `dbus` must be in
-   the service `targetPkgs` (`/usr/bin/dbus-daemon`). A stale instance squatting the
-   abstract socket causes `Address already in use` - kill leftover `ACVC.GTK.Service`
-   processes (`sudo ss -xlp | grep awsvpnclient`).
-
-2. **Malformed `IsExclusiveAppInstance` boolean.** The service's reply encodes a bad
-   boolean; the GUI throws `Read value 17 at position 4 while expecting boolean`. The
-   hook's `sendmsg`/`write` interceptors (vendored from BOPOHA `hook0.c`) rewrite the
-   reply boolean to true. It runs inside the dbus-daemon, which forwards both the call
-   and the reply.
-
-3. **`ValidatePidBinaryPath` caller check.** The service `readlink()`s
-   `/proc/<caller>/exe` and rejects the call unless the directory is exactly
-   `/opt/awsvpnclient`; in the sandbox the GUI's exe resolves to its `/nix/store` path
-   (`...not in /opt/awsvpnclient`). The hook's `readlink`/`readlinkat` interceptors
-   rewrite a `/proc/*/exe` target ending in `/opt/awsvpnclient/awsvpnclient` back to
-   that bare path. `acvc-openvpn` and everything else are left untouched.
-
-**CRITICAL: build the hook with FORTIFY_SOURCE disabled.** nixpkgs' `runCommandCC`
-enables fortification by default, turning `fprintf`/`memcpy` into glibc's `__*_chk`
-variants. musl has no `__fprintf_chk`, so every musl child (`openssl`, `acvc-openvpn`)
-dies at load with `Error relocating ... __fprintf_chk: symbol not found` - which
-surfaces only later as `UnableToEnforceFipsException`. The fix is
-`hardeningDisable = ["fortify" "fortify3"]` plus `-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0`.
-This is the same musl/glibc LD_PRELOAD hazard the rest of this doc warns about; the
-shim only stays safe because it uses plain libc symbols that resolve under both.
+The 5.x `#!/usr/bin/env bash` PATH problem does not recur: it was caused by the musl
+openvpn subprocess, and openvpn is now in-process.
 
 ## Testing Techniques
+
+### Running the daemon by hand
+
+`buildFHSEnv` passes `--die-with-parent` to bubblewrap, so backgrounding the wrapper
+from a shell that then exits kills the daemon and leaves a stale socket behind. Use
+systemd instead:
+
+```bash
+svc=$(nix build .#awsvpnclient-service --no-link --print-out-paths)
+sudo systemd-run --unit=awsvpn-test --collect "$svc/bin/awsvpnclient-service"
+journalctl -u awsvpn-test -f
+sudo systemctl stop awsvpn-test
+```
 
 ### Testing Inside the FHS Environment
 
 Create a test script and inject it into the FHS wrapper:
 
 ```bash
-# Create test script
 cat > /tmp/my-test.sh << 'EOF'
 #!/bin/bash
 source /etc/profile
@@ -198,107 +265,71 @@ source /etc/profile
 EOF
 chmod +x /tmp/my-test.sh
 
-# Get the service wrapper and modify it to run your test
 servicePath=$(nix build .#awsvpnclient-service --no-link --print-out-paths)
-cat "$servicePath/bin/awsvpnclient-service" | \
-  sed 's|/nix/store/[a-z0-9]*-awsvpnclient-service-init|/tmp/my-test.sh|' > /tmp/test-wrapper.sh
+sed 's|/nix/store/[a-z0-9]*-awsvpnclient-service-init|/tmp/my-test.sh|' \
+  "$servicePath/bin/awsvpnclient-service" > /tmp/test-wrapper.sh
 chmod +x /tmp/test-wrapper.sh
-
-# Run the test inside the FHS environment
-/tmp/test-wrapper.sh
+sudo /tmp/test-wrapper.sh
 ```
 
-### Testing OpenVPN Script Execution
+### The CLI as a probe
+
+The .deb ships an `aws-vpn-client` CLI that exercises the same IPC surface as the
+GUI without needing a display:
+
+```
+list-profiles  list-connections  list-preferences  get-connection-status
+connect  disconnect  import-profile  send-diagnostic-logs
+```
+
+It is exposed as `.#awsvpnclient-cli` and the module installs it alongside the GUI.
+It is the one component with no FHS environment - it resolves nothing under the
+install prefix and needs only libc/libm/libgcc_s, so `autoPatchelfHook` suffices,
+which is why its closure is 46 MB against the GUI's 2 GB. `$out/bin/aws-vpn-client`
+symlinks into `$out/opt/awsvpnclient/`, because the daemon validates callers by the
+tail of their `/proc/<pid>/exe`.
+
+### Viewing logs
 
 ```bash
-# Inside FHS, test if openvpn can run scripts
-cat > /tmp/test-script.sh << 'SCRIPT'
-#!/usr/bin/env bash
-echo "PATH=$PATH" > /tmp/test-result.log
-mkdir --version >> /tmp/test-result.log 2>&1
-SCRIPT
-chmod +x /tmp/test-script.sh
-
-timeout 3 /opt/awsvpnclient/Service/Resources/openvpn/acvc-openvpn \
-  --dev null --script-security 2 --up /tmp/test-script.sh 2>&1
-
-cat /tmp/test-result.log
+sudo tail -f /var/log/awsvpnclient/aws_vpn_client_daemon_*.log
+sudo cat /var/log/awsvpnclient/configure-dns-up.log
+sudo cat /var/log/awsvpnclient/configure-dns-down.log
 ```
 
-### Checking Interpreter
+`dns/configure-dns` documents and reads `ZENTRY_LOG_DIR` to relocate its logs. The
+daemon carries `ZENTRY_LOG` (log level) and what looks like the same `ZENTRY_LOG_DIR`
+in its string table, but neither has been tested here.
 
-```bash
-# Check what interpreter a binary uses
-nix-shell -p patchelf --run "patchelf --print-interpreter /path/to/binary"
-```
+### Inspecting a new release
 
-### Viewing Service Logs
-
-```bash
-# AWS VPN Client logs to:
-tail -f /var/log/aws-vpn-client/*/gtk_service_aws_client_vpn_connect_*.log
-
-# DNS configuration logs:
-cat /var/log/aws-vpn-client/configure-dns-up.log
-cat /var/log/aws-vpn-client/configure-dns-down.log
-```
-
-## DBus Requirements
-
-As of 5.4.0 the service runs its **own** private `dbus-daemon` on
-`unix:abstract=awsvpnclient` (in the shared network namespace via `--share-net`), and
-the GUI connects to that. The system-bus binds below are still present but are likely
-vestigial now - candidate for removal, test a full connect before dropping them:
-
-```nix
-extraBwrapArgs = [
-  "--bind-try" "/run/dbus" "/run/dbus"
-  "--bind-try" "/var/run/dbus" "/var/run/dbus"
-];
-```
-
-See "Version 5.4.0 workarounds" for the dbus-daemon package requirement and the
-`acvc-hook.c` shim that fixes the IPC.
+The daemon is an unstripped Rust binary, so its behaviour is largely readable from
+`strings`: module paths (`src/daemon/src/...`), log messages, env var names and
+hardcoded paths all survive. That is how the caller check and the 0700 requirement
+above were found.
 
 ## Required System Utilities
 
-The service expects these at standard FHS paths:
-- `ps` - /bin/ps
-- `lsof` - /usr/bin/lsof
-- `sysctl` - /sbin/sysctl (from procps)
-- `ip` - /sbin/ip (from iproute2)
-- `resolvectl` - /run/current-system/sw/bin/resolvectl (for DNS configuration)
-
-## .NET Runtime Requirements
-
-```nix
-multiPkgs = _: with pkgs; [
-  openssl
-  icu74
-  zlib
-];
-
-profile = ''
-  export DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
-  export DOTNET_CLI_TELEMETRY_OPTOUT=1
-'';
-```
+The daemon expects these at standard FHS paths:
+- `resolvectl` - /usr/bin/resolvectl (DNS configuration, from systemd)
+- `mkdir`, `rm`, `date` - /usr/bin/... (used by `dns/configure-dns`)
+- `ip` - /sbin/ip (from iproute2, routing table operations)
 
 ## Common Errors
 
 | Error | Cause | Solution |
 |-------|-------|----------|
-| `OvpnResourcesChecksumValidationFailedException` | Modified files in openvpn directory | Don't modify checksummed files |
-| `OvpnProcessFailedToStartException: -1` | Interpreter not found | Ensure cwd is `/` and symlink exists |
-| `Read-only file system` | Writing to Nix store | Add `--tmpfs` for writable directories |
-| `could not execute external program` | Script PATH broken | Use env wrapper to fix PATH |
-| `command not found` in scripts | PATH is `/no-such-path` | Use env wrapper |
-| `Could not load file or assembly 'Microsoft.Data.Sqlite'` | SQLite stripped from deps.json | Expected/benign - do NOT restore SQLite (native segfault) |
-| `Read value 17 ... while expecting boolean` | 5.4.0 IsExclusiveAppInstance bug | `acvc-hook.c` rewrites the reply boolean |
-| `Binary path of caller PID ... not in /opt/awsvpnclient` | 5.4.0 ValidatePidBinaryPath vs sandbox | `acvc-hook.c` rewrites `/proc/*/exe` readlink |
-| `UnableToEnforceFipsException` | FIPS provider not active | Check `fipsmodule.cnf` generated; ensure hook built without FORTIFY (musl `__fprintf_chk`) |
-| `Error relocating ... __fprintf_chk: symbol not found` | Hook built with FORTIFY_SOURCE | `hardeningDisable=["fortify" "fortify3"]` + `-D_FORTIFY_SOURCE=0` |
-| `Address already in use` (dbus) | Stale service squatting abstract socket | Kill leftover `ACVC.GTK.Service` procs |
+| `Binary path of caller PID ... not allowed` | Caller check vs sandbox | `caller-path-hook.c` rewrites `/proc/*/exe` readlink |
+| `Connection failed: transport error` (GUI) | Daemon not running, or stale socket after it died | Check the unit; `RuntimeDirectory` clears the socket |
+| `Directory has insecure permissions: 755, expected 700` | `/var/lib/awsvpnclient` left from a 5.x install | `StateDirectoryMode=0700` |
+| `libgbm.so.1: cannot open shared object file` | Electron dep missing from `targetPkgs` | Add the library (`libgbm`) |
+| `design token #XXXXXX is no longer in the renderer bundle` | Release reshuffled the GUI palette | Re-audit `designTokens` in `shared.nix` |
+| `attribute 'base0D' missing` when building the GUI | Argument named `palette` collides with `pkgs.palette` | Keep it named `base16Palette` |
+| GUI dies the moment the launching shell exits | `buildFHSEnv` sets bwrap `--die-with-parent` | Launch via systemd, not a backgrounded shell |
+| `substituteInPlace: pattern not found` | Release rewrote a patched `main.js` handler | Re-audit the popup patches in `shared.nix` |
+| GUI exits immediately, no window | Injected JS is malformed | The `node --check` gate should catch this at build time |
+| `Could not start dynamically linked executable` | Running a binary outside the FHS env | Use the wrapper, not the raw store path |
+| `Failed to obtain Cognito identity` | Telemetry upload without credentials | Benign |
 
 ## Version Override
 
@@ -306,15 +337,15 @@ The package supports overriding the version:
 
 ```nix
 awsvpnclient.overrideVersion {
-  version = "5.4.0";
-  sha256 = "sha256-...";
+  version = "6.0.1";
+  sha256 = "...";
 }
 ```
 
 ## Running
 
 ```bash
-# Terminal 1: Start service (requires root for tun devices)
+# Terminal 1: Start daemon (requires root for tun devices)
 sudo nix run .#awsvpnclient-service
 
 # Terminal 2: Start GUI

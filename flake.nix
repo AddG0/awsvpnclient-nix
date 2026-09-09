@@ -18,9 +18,11 @@
       perSystem = {pkgs, ...}: let
         shared = import ./pkgs/shared.nix pkgs;
       in {
-        packages = {
-          default = pkgs.callPackage ./pkgs/application.nix {inherit shared;};
+        packages = rec {
+          default = awsvpnclient;
+          awsvpnclient = pkgs.callPackage ./pkgs/application.nix {inherit shared;};
           awsvpnclient-service = pkgs.callPackage ./pkgs/service.nix {inherit shared;};
+          awsvpnclient-cli = pkgs.callPackage ./pkgs/cli.nix {inherit shared;};
         };
       };
     });
