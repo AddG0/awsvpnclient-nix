@@ -61,15 +61,15 @@
           nss
           pango
           udev
-          xorg.libX11
-          xorg.libXcomposite
-          xorg.libXdamage
-          xorg.libXext
-          xorg.libXfixes
-          xorg.libXrandr
-          xorg.libXScrnSaver
-          xorg.libxcb
-          xorg.libXtst
+          libx11
+          libxcomposite
+          libxdamage
+          libxext
+          libxfixes
+          libxrandr
+          libxscrnsaver
+          libxcb
+          libxtst
         ];
 
       # /run - where the GUI finds the daemon's socket - is bind-mounted from the
