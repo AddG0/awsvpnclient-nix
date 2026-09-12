@@ -10,7 +10,11 @@ The package is split into:
 - `pkgs/service.nix` - privileged daemon wrapped in buildFHSEnv
 - `pkgs/caller-path-hook.c` - small LD_PRELOAD shim so the daemon's caller check
   accepts the sandboxed GUI/CLI (see "Caller path validation" below)
-- `module.nix` - NixOS module (systemd unit + state/runtime directories)
+- `nixos-module.nix` - `services.awsvpnclient`: the systemd unit, state/runtime
+  directories and the CLI
+- `home-module.nix` - `programs.awsvpnclient`: the per-user GUI, where a Stylix
+  palette actually lives. Set `services.awsvpnclient.installGui = false` when using
+  it, or the GUI is installed twice and `$PATH` decides which one runs.
 
 ## What 6.0.0 changed
 
@@ -155,8 +159,14 @@ We="#FCFCFD",cu="#EBEBF0",qe="#FFFFFF",...,Ee="#FF9900",ha="#F0F0F0",_u="#DEDEE3
 ```
 
 `designTokens` in `shared.nix` maps each to a base16 slot, and `mkGuiFiles` rewrites
-them when a palette is supplied. `programs.awsvpnclient.palette` defaults to
-`config.lib.stylix.colors`; `null` leaves the colours alone.
+them when a palette is supplied. Both modules expose a `palette` option defaulting to
+`config.lib.stylix.colors` **when Stylix is enabled** - guarding on the module merely
+being imported throws `stylix: one of 'stylix.image' or 'stylix.base16Scheme' must be
+set` on hosts that import Stylix without configuring it.
+
+Muted text maps to `base04`, which base16 leaves free to be a status-bar tone rather
+than a foreground; it ranges from 2.1:1 to 9.2:1 against `base00` across schemes, so a
+palette whose `base04` is unreadable wants it overridden by the consumer.
 
 Three things the token rewrite cannot express, all handled alongside it:
 

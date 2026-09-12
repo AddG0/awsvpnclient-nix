@@ -18,6 +18,11 @@ in
 
     # The daemon validates callers by the tail of their /proc/<pid>/exe, so the binary
     # has to keep its install-prefix layout.
+    meta = shared.mkMeta {
+      description = "Command-line client for AWS Client VPN";
+      mainProgram = "aws-vpn-client";
+    };
+
     installPhase = ''
       install -Dm755 ${deb}${shared.cliExe} "$out${shared.cliExe}"
       mkdir -p "$out/bin"

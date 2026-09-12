@@ -13,7 +13,7 @@
   desktopItem = makeDesktopItem {
     name = "AWS VPN Client";
     desktopName = "AWS VPN Client";
-    exec = "awsvpnclient %U";
+    exec = "aws-vpn-client-gui %U";
     icon = "awsvpnclient";
     comment = "AWS VPN Client provides secure VPN connectivity";
     categories = ["Network" "X-VPN"];
@@ -28,7 +28,7 @@
     };
   in
     buildFHSEnv {
-      name = shared.pname;
+      name = "aws-vpn-client-gui";
       inherit (versionInfo) version;
 
       # AWS's own launcher, which forces X11/XWayland rendering and points Electron
@@ -74,6 +74,11 @@
 
       # /run - where the GUI finds the daemon's socket - is bind-mounted from the
       # host by buildFHSEnv already, so no extraBwrapArgs are needed.
+
+      meta = shared.mkMeta {
+        description = "Electron GUI for AWS Client VPN";
+        mainProgram = "aws-vpn-client-gui";
+      };
 
       extraInstallCommands = ''
         mkdir -p "$out/share/applications"

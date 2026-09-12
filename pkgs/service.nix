@@ -41,6 +41,11 @@ in
     # No extraBwrapArgs: buildFHSEnv already shares the host network namespace, /dev,
     # and every host directory the rootfs does not provide, /run included.
 
+    meta = shared.mkMeta {
+      description = "Privileged daemon for AWS Client VPN";
+      mainProgram = "awsvpnclient-service";
+    };
+
     profile = ''
       export LD_PRELOAD="${callerPathHook}/lib/caller-path-hook.so''${LD_PRELOAD:+:$LD_PRELOAD}"
     '';

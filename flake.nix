@@ -11,8 +11,13 @@
       systems = ["x86_64-linux"];
 
       flake.nixosModules = {
-        awsvpnclient = moduleWithSystem (perSystem@{config, ...}: import ./module.nix perSystem);
+        awsvpnclient = moduleWithSystem (perSystem@{config, ...}: import ./nixos-module.nix perSystem);
         default = inputs.self.nixosModules.awsvpnclient;
+      };
+
+      flake.homeModules = {
+        awsvpnclient = moduleWithSystem (perSystem@{config, ...}: import ./home-module.nix perSystem);
+        default = inputs.self.homeModules.awsvpnclient;
       };
 
       perSystem = {pkgs, ...}: let

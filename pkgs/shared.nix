@@ -25,6 +25,20 @@ pkgs: let
   daemonExe = "${installPrefix}/aws-client-vpn-daemon";
   iconFile = "${installPrefix}/resources/app.png";
 
+  # AWS ships no EULA in the .deb - the bundled LICENSE is Electron's MIT - but the
+  # client itself is proprietary, redistributed here as a prebuilt binary.
+  mkMeta = {
+    description,
+    mainProgram,
+  }: {
+    inherit description mainProgram;
+    homepage = "https://aws.amazon.com/vpn/";
+    downloadPage = "https://docs.aws.amazon.com/vpn/latest/clientvpn-user/client-vpn-connect-linux-release-notes.html";
+    license = lib.licenses.unfree;
+    sourceProvenance = [lib.sourceTypes.binaryNativeCode];
+    platforms = ["x86_64-linux"];
+  };
+
   # The GUI has no theme support at all, and this Electron build lacks Blink's
   # auto-dark feature, so rewriting these literals is the only seam. Each maps to the
   # base16 slot matching its role in the stock light theme.
@@ -204,6 +218,6 @@ CSS
       test -f "$dst/resources/app.asar.unpacked/dist-electron/daemon-client.node"
     '';
 in {
-  inherit pname versionInfo mkDeb mkGuiFiles;
+  inherit pname versionInfo mkDeb mkGuiFiles mkMeta;
   inherit installPrefix guiExe guiLauncher daemonExe cliExe iconFile;
 }

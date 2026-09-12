@@ -23,7 +23,7 @@ Import the module and enable:
     modules = [
       awsvpnclient-nix.nixosModules.default
       {
-        programs.awsvpnclient.enable = true;
+        services.awsvpnclient.enable = true;
       }
     ];
   };
