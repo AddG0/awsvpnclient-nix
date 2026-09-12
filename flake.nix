@@ -7,16 +7,16 @@
   };
 
   outputs = inputs @ {flake-parts, ...}:
-    flake-parts.lib.mkFlake {inherit inputs;} ({moduleWithSystem, ...}: {
+    flake-parts.lib.mkFlake {inherit inputs;} ({...}: {
       systems = ["x86_64-linux"];
 
       flake.nixosModules = {
-        awsvpnclient = moduleWithSystem (perSystem@{config, ...}: import ./nixos-module.nix perSystem);
+        awsvpnclient = import ./nixos-module.nix;
         default = inputs.self.nixosModules.awsvpnclient;
       };
 
       flake.homeModules = {
-        awsvpnclient = moduleWithSystem (perSystem@{config, ...}: import ./home-module.nix perSystem);
+        awsvpnclient = import ./home-module.nix;
         default = inputs.self.homeModules.awsvpnclient;
       };
 

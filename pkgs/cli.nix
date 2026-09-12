@@ -28,4 +28,12 @@ in
       mkdir -p "$out/bin"
       ln -s "$out${shared.cliExe}" "$out/bin/aws-vpn-client"
     '';
+
+    # A phase, not postFixup: runHook evaluates the postFixup attribute before
+    # postFixupHooks, so autoPatchelfHook has not run yet and the binary cannot execute.
+    preDistPhases = ["genCompletionsPhase"];
+    genCompletionsPhase = ''
+      # The CLI makes a log dir under $HOME before parsing argv; /homeless-shelter is not writable.
+      HOME=$(mktemp -d) bash ${./gen-completions.sh} "$out${shared.cliExe}" "$out"
+    '';
   }

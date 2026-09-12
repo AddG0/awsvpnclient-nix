@@ -1,14 +1,18 @@
-perSystem: {
+{
   lib,
   config,
+  pkgs,
   ...
-}: {
+}: let
+  shared = import ./pkgs/shared.nix pkgs;
+in {
   options.programs.awsvpnclient = {
     enable = lib.mkEnableOption "the AWS VPN Client GUI for this user";
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = perSystem.config.packages.default;
+      default = pkgs.callPackage ./pkgs/application.nix {inherit shared;};
+      defaultText = lib.literalExpression "pkgs.callPackage ./pkgs/application.nix { }";
       description = "The awsvpnclient GUI package to use.";
     };
 

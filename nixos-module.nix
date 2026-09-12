@@ -1,4 +1,12 @@
-perSystem: {lib, config, ...}: {
+{
+  lib,
+  config,
+  pkgs,
+  ...
+}: let
+  # The host's pkgs, not the flake's own, so the consumer's allowUnfree applies.
+  shared = import ./pkgs/shared.nix pkgs;
+in {
   imports =
     map (
       opt:
@@ -13,19 +21,22 @@ perSystem: {lib, config, ...}: {
 
     guiPackage = lib.mkOption {
       type = lib.types.package;
-      default = perSystem.config.packages.default;
+      default = pkgs.callPackage ./pkgs/application.nix {inherit shared;};
+      defaultText = lib.literalExpression "pkgs.callPackage ./pkgs/application.nix { }";
       description = "The awsvpnclient GUI package to use.";
     };
 
     servicePackage = lib.mkOption {
       type = lib.types.package;
-      default = perSystem.config.packages.awsvpnclient-service;
+      default = pkgs.callPackage ./pkgs/service.nix {inherit shared;};
+      defaultText = lib.literalExpression "pkgs.callPackage ./pkgs/service.nix { }";
       description = "The awsvpnclient-service package to use.";
     };
 
     cliPackage = lib.mkOption {
       type = lib.types.package;
-      default = perSystem.config.packages.awsvpnclient-cli;
+      default = pkgs.callPackage ./pkgs/cli.nix {inherit shared;};
+      defaultText = lib.literalExpression "pkgs.callPackage ./pkgs/cli.nix { }";
       description = "The aws-vpn-client CLI package to use.";
     };
 
